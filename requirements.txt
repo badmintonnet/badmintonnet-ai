@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+langchain
+langchain-core
+langchain-community
+langchain-groq
+langchain-huggingface
+langchain-text-splitters
+langchain-mcp-adapters
+langgraph
+langgraph-prebuilt
+faiss-cpu
+httpx-sse
+mcp
+sentence-transformers
+python-dotenv
