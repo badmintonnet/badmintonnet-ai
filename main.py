@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from agent.graph import cleanup_graph, get_graph, get_mcp_tool_names
 from agent.request_context import request_access_token_scope
+from memory.store import get_session_memory_context, save_session_turn
 from models.llm import llm
 from prompts.system_prompt import SYSTEM_PROMPT
 from rag.retriever import retriever
@@ -66,6 +67,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 class ChatRequest(BaseModel):
+    sessionId: str
     question: str
     access_token: str | None = None
 
@@ -111,6 +113,48 @@ def _extract_access_token(
     return header_value
 
 
+def _build_chat_input(
+    question: str,
+    memory_context: str,
+    rag_context: str,
+) -> str:
+    parts = [f"Cau hoi hien tai:\n{question.strip()}"]
+
+    if memory_context.strip():
+        parts.insert(0, f"Context phien chat truoc do:\n{memory_context.strip()}")
+
+    if rag_context.strip():
+        insert_at = 1 if memory_context.strip() else 0
+        parts.insert(insert_at, f"Knowledge base lien quan:\n{rag_context.strip()}")
+
+    return "\n\n".join(parts)
+
+
+def _safe_get_session_memory_context(session_id: str, question: str) -> str:
+    try:
+        return get_session_memory_context(session_id, question)
+    except Exception:
+        logger.exception("[CHAT] Failed to load session memory for session_id=%s", session_id)
+        return ""
+
+
+def _safe_get_rag_context(question: str) -> str:
+    try:
+        docs = retriever.invoke(question)
+    except Exception:
+        logger.exception("[CHAT] Failed to retrieve RAG context")
+        return ""
+
+    return "\n".join(doc.page_content for doc in docs)
+
+
+def _safe_save_session_turn(session_id: str, question: str, answer: str) -> None:
+    try:
+        save_session_turn(session_id, question, answer)
+    except Exception:
+        logger.exception("[CHAT] Failed to persist session memory for session_id=%s", session_id)
+
+
 @app.post("/chat")
 async def chat(
     payload: ChatRequest,
@@ -125,7 +169,11 @@ async def chat(
     graph = await get_graph()
     mcp_tool_names = get_mcp_tool_names()
     access_token = _extract_access_token(payload.access_token, authorization)
+    memory_context = _safe_get_session_memory_context(payload.sessionId, payload.question)
+    rag_context = _safe_get_rag_context(payload.question)
+    chat_input = _build_chat_input(payload.question, memory_context, rag_context)
     logger.info("ACCESS TOKEN AI: %s", access_token)
+    logger.info("[CHAT] session_id=%s", payload.sessionId)
     logger.info("[CHAT] question=%s", _shorten(payload.question, 200))
     logger.info(
         "[CHAT] mcp_tools=%s",
@@ -137,7 +185,7 @@ async def chat(
             async with _llm_semaphore:
                 result = await asyncio.wait_for(
                     graph.ainvoke(
-                        {"messages": [HumanMessage(content=payload.question)]},
+                        {"messages": [HumanMessage(content=chat_input)]},
                         config={
                             "callbacks": [ToolLogHandler(mcp_tool_names)],
                             "recursion_limit": AGENT_RECURSION_LIMIT,
@@ -146,6 +194,7 @@ async def chat(
                     timeout=AGENT_TIMEOUT_SECONDS,
                 )
         answer = result["messages"][-1].content
+        _safe_save_session_turn(payload.sessionId, payload.question, answer)
         return {"answer": answer, "source": "agent"}
     except Exception as exc:
         logger.exception("[CHAT] Agent failed, fallback to RAG: %s", exc)
@@ -154,19 +203,20 @@ async def chat(
         if _is_rate_limit_error(exc):
             _mark_rate_limited_now()
             return {
-                "answer": "AI dang qua tai. Ban cho 10-20 giay roi thu lai nhe.",
+                "answer": "AI đang quá tải. Bạn chờ 10-20 giây để thử lại nhé.",
                 "source": "rate-limit",
                 "error": str(exc),
             }
 
         # Fallback to direct RAG answer if tool-calling fails.
-        docs = retriever.invoke(payload.question)
-        context = "\n".join([doc.page_content for doc in docs])
         prompt = f"""
         {SYSTEM_PROMPT}
 
+        Session memory:
+        {memory_context}
+
         Context:
-        {context}
+        {rag_context}
 
         Question:
         {payload.question}
@@ -180,11 +230,13 @@ async def chat(
             if _is_rate_limit_error(fallback_exc):
                 _mark_rate_limited_now()
                 return {
-                    "answer": "AI dang qua tai. Ban cho 10-20 giay roi thu lai nhe.",
+                    "answer": "AI đang quá tải. Bạn chờ 10-20 giây để thử lại nhé.",
                     "source": "rate-limit",
                     "error": str(fallback_exc),
                 }
             raise
+
+        _safe_save_session_turn(payload.sessionId, payload.question, answer)
 
         return {
             "answer": answer,
