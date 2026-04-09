@@ -1,3 +1,5 @@
+import os
+
 import httpx
 import logging
 from collections.abc import Awaitable, Callable
@@ -6,15 +8,18 @@ from typing import Any
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 from langgraph.prebuilt import ToolNode, create_react_agent
-
+from dotenv import load_dotenv
 from agent.request_context import get_request_access_token
 from agent.tools import rag_search
 from models.llm import llm
 from prompts.system_prompt import SYSTEM_PROMPT
 
+load_dotenv()
+
+
 MCP_CONFIG = {
 	"badmintonnet": {
-		"url": "http://127.0.0.1:3001/sse",
+		"url": f"{os.getenv("MCP_BASE_URL", "http://localhost:3002/sse")}",
 		"transport": "sse",
 	}
 }
@@ -22,7 +27,6 @@ MCP_CONFIG = {
 _mcp_client: MultiServerMCPClient | None = None
 _graph = None
 _mcp_tool_names: set[str] = set()
-BACKEND_BASE_URL = "http://127.0.0.1:8080"
 logger = logging.getLogger("badmintonnet.agent")
 
 
@@ -38,16 +42,6 @@ async def _inject_access_token_header(
         request = request.override(headers=headers)
 
     return await handler(request)
-
-
-async def _is_backend_up() -> bool:
-	"""Fast health check for MCP downstream backend."""
-	try:
-		async with httpx.AsyncClient(timeout=1.5) as client:
-			resp = await client.get(BACKEND_BASE_URL)
-			return resp.status_code < 500
-	except Exception:
-		return False
 
 
 async def build_graph():
