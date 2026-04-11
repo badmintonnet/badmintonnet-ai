@@ -19,7 +19,7 @@ load_dotenv()
 
 MCP_CONFIG = {
 	"badmintonnet": {
-		"url": f"{os.getenv("MCP_BASE_URL", "http://localhost:3002/sse")}",
+		"url": os.getenv("MCP_BASE_URL", "http://localhost:3002/sse"),
 		"transport": "sse",
 	}
 }
