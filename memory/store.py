@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import logging
 import os
+from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ logger = logging.getLogger("badmintonnet.memory")
 MEMORY_STORE_PATH = os.getenv("SESSION_MEMORY_STORE_PATH", "session_memory_store")
 MEMORY_RETRIEVE_K = int(os.getenv("SESSION_MEMORY_RETRIEVE_K", "4"))
 _store_lock = Lock()
+_INDEX_NAME = "index"
 
 
 def _utc_now_iso() -> str:
@@ -35,12 +37,18 @@ def _build_empty_vectorstore() -> FAISS:
 
 
 def _load_vectorstore() -> FAISS:
-    if os.path.isdir(MEMORY_STORE_PATH):
+    store_path = Path(MEMORY_STORE_PATH)
+    index_file = store_path / f"{_INDEX_NAME}.faiss"
+    metadata_file = store_path / f"{_INDEX_NAME}.pkl"
+
+    if index_file.is_file() and metadata_file.is_file():
         return FAISS.load_local(
-            MEMORY_STORE_PATH,
+            str(store_path),
             embedding,
+            index_name=_INDEX_NAME,
             allow_dangerous_deserialization=True,
         )
+
     return _build_empty_vectorstore()
 
 
@@ -56,6 +64,10 @@ def get_session_memory_context(
 
     with _store_lock:
         vectorstore = _load_vectorstore()
+        if not vectorstore.index_to_docstore_id:
+            logger.info("[MEMORY][RETRIEVE] session_id=%s skipped empty store", session_id)
+            return ""
+
         docs = vectorstore.similarity_search(
             query,
             k=max(1, k),
@@ -110,6 +122,7 @@ def save_session_turn(session_id: str, question: str, answer: str) -> None:
         vectorstore = _load_vectorstore()
         doc_id = str(uuid4())
         vectorstore.add_documents([document], ids=[doc_id])
+        os.makedirs(MEMORY_STORE_PATH, exist_ok=True)
         vectorstore.save_local(MEMORY_STORE_PATH)
         total_docs = len(vectorstore.index_to_docstore_id)
 

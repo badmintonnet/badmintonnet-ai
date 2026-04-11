@@ -172,7 +172,7 @@ async def chat(
     memory_context = _safe_get_session_memory_context(payload.sessionId, payload.question)
     rag_context = _safe_get_rag_context(payload.question)
     chat_input = _build_chat_input(payload.question, memory_context, rag_context)
-    logger.info("ACCESS TOKEN AI: %s", access_token)
+    logger.info("[CHAT] access_token_present=%s", bool(access_token))
     logger.info("[CHAT] session_id=%s", payload.sessionId)
     logger.info("[CHAT] question=%s", _shorten(payload.question, 200))
     logger.info(
