@@ -51,7 +51,7 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT }}
           script: |
-            cd /var/www/badmintonnet-ai
+            cd /var/www/badmintonnet_ai
             git pull origin main
             docker compose pull badmintonnet-ai
             docker compose up -d
