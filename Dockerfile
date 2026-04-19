@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -10,8 +11,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-ARG HF_TOKEN=
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -21,7 +20,8 @@ COPY requirements.txt .
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
-RUN HF_TOKEN="${HF_TOKEN}" python -c "from sentence_transformers import SentenceTransformer; import os; SentenceTransformer(os.environ['EMBEDDING_MODEL_NAME'], cache_folder=os.environ['SENTENCE_TRANSFORMERS_HOME'])"
+RUN --mount=type=secret,id=hf_token,required=false \
+    sh -c 'if [ -f /run/secrets/hf_token ]; then export HF_TOKEN="$(cat /run/secrets/hf_token)"; fi; python -c "from sentence_transformers import SentenceTransformer; import os; SentenceTransformer(os.environ[\"EMBEDDING_MODEL_NAME\"], cache_folder=os.environ[\"SENTENCE_TRANSFORMERS_HOME\"])"'
 
 COPY . .
 
