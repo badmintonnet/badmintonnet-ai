@@ -72,6 +72,10 @@ class ChatRequest(BaseModel):
     access_token: str | None = None
 
 
+class ConversationTitleRequest(BaseModel):
+    message: str
+
+
 def _is_rate_limit_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return (
@@ -153,6 +157,24 @@ def _safe_save_session_turn(session_id: str, question: str, answer: str) -> None
         save_session_turn(session_id, question, answer)
     except Exception:
         logger.exception("[CHAT] Failed to persist session memory for session_id=%s", session_id)
+
+
+def _normalize_generated_title(raw_title: str) -> str:
+    title = raw_title.strip().strip("\"'`")
+    title = " ".join(title.split())
+    return title[:120].rstrip(" .,;:-")
+
+
+def _build_title_fallback(message: str) -> str:
+    cleaned = " ".join(message.strip().split())
+    if not cleaned:
+        return "Cuộc trò chuyện mới"
+
+    words = cleaned.split()
+    fallback = " ".join(words[:8])
+    if len(words) > 8:
+        fallback = f"{fallback}..."
+    return fallback[:120]
 
 
 @app.post("/chat")
@@ -241,5 +263,39 @@ async def chat(
         return {
             "answer": answer,
             "source": "fallback-rag",
+            "error": str(exc),
+        }
+
+
+@app.post("/conversation-title")
+async def generate_conversation_title(payload: ConversationTitleRequest):
+    message = payload.message.strip()
+    if not message:
+        return {"title": "Cuộc trò chuyện mới", "source": "fallback"}
+
+    prompt = f"""
+    Bạn là trợ lý đặt tiêu đề cho cuộc hội thoại.
+    Hãy tạo đúng 1 tiêu đề ngắn gọn, rõ nghĩa cho cuộc trò chuyện dựa trên tin nhắn đầu tiên.
+    Yêu cầu:
+    - Chỉ trả về duy nhất tiêu đề, không giải thích.
+    - Tối đa 12 từ.
+    - Bắt buộc dùng tiếng Việt có dấu tự nhiên, rõ ràng.
+
+    Tin nhắn đầu tiên:
+    {message}
+    """
+
+    try:
+        async with _llm_semaphore:
+            llm_result = await asyncio.to_thread(llm.invoke, prompt)
+        title = _normalize_generated_title(llm_result.content)
+        if not title:
+            raise ValueError("Empty title returned from LLM")
+        return {"title": title, "source": "llm"}
+    except Exception as exc:
+        logger.exception("[TITLE] Failed to generate conversation title: %s", exc)
+        return {
+            "title": _build_title_fallback(message),
+            "source": "fallback",
             "error": str(exc),
         }
