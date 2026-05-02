@@ -51,6 +51,10 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT }}
           script: |
+            set -e
             cd /var/www/badmintonnet_ai
+
             docker compose pull badmintonnet-ai
-            docker compose up -d
+            docker compose up -d --force-recreate --no-deps badmintonnet-ai
+
+            docker image prune -f
