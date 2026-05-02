@@ -1,8 +1,11 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 import logging
 import os
+import re
 import time
+from typing import TypeVar
 
 from fastapi import FastAPI, Header
 from langchain_core.callbacks.base import BaseCallbackHandler
@@ -24,9 +27,13 @@ logger = logging.getLogger("badmintonnet.agent")
 AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "45"))
 AGENT_RECURSION_LIMIT = int(os.getenv("AGENT_RECURSION_LIMIT", "6"))
 LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "1"))
-RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "8"))
+LLM_MIN_INTERVAL_SECONDS = float(os.getenv("LLM_MIN_INTERVAL_SECONDS", "3"))
+RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "35"))
 _llm_semaphore = asyncio.Semaphore(max(1, LLM_MAX_CONCURRENCY))
+_llm_schedule_lock = asyncio.Lock()
+_next_llm_request_at = 0.0
 _rate_limited_until = 0.0
+T = TypeVar("T")
 
 
 def _shorten(value: object, limit: int = 300) -> str:
@@ -85,13 +92,80 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     )
 
 
-def _mark_rate_limited_now() -> None:
+def _extract_retry_after_seconds(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    retry_after = None
+    if headers:
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            pass
+
+    text = str(exc)
+    patterns = (
+        r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|milliseconds|s|sec|seconds|m|minutes)?",
+        r"retry(?:-after| after)?[:=\s]+([0-9]+(?:\.[0-9]+)?)\s*(ms|milliseconds|s|sec|seconds|m|minutes)?",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+
+        value = float(match.group(1))
+        unit = (match.group(2) or "seconds").lower()
+        if unit in {"ms", "milliseconds"}:
+            return max(0.0, value / 1000)
+        if unit in {"m", "minutes"}:
+            return max(0.0, value * 60)
+        return max(0.0, value)
+
+    return None
+
+
+def _mark_rate_limited_now(exc: Exception | None = None) -> None:
     global _rate_limited_until
-    _rate_limited_until = time.monotonic() + RATE_LIMIT_COOLDOWN_SECONDS
+    retry_after_seconds = _extract_retry_after_seconds(exc) if exc else None
+    cooldown_seconds = max(RATE_LIMIT_COOLDOWN_SECONDS, retry_after_seconds or 0.0)
+    _rate_limited_until = time.monotonic() + cooldown_seconds
+    logger.warning("[RATE_LIMIT] Cooling down LLM calls for %.1fs", cooldown_seconds)
 
 
 def _is_in_rate_limit_cooldown() -> bool:
     return time.monotonic() < _rate_limited_until
+
+
+async def _wait_for_llm_slot() -> None:
+    global _next_llm_request_at
+
+    async with _llm_schedule_lock:
+        now = time.monotonic()
+        wait_seconds = max(
+            0.0,
+            _rate_limited_until - now,
+            _next_llm_request_at - now,
+        )
+
+        if wait_seconds:
+            logger.info("[LLM_GATE] Waiting %.1fs before next LLM call", wait_seconds)
+            await asyncio.sleep(wait_seconds)
+            now = time.monotonic()
+
+        _next_llm_request_at = now + max(0.0, LLM_MIN_INTERVAL_SECONDS)
+
+
+async def _run_llm_call(call: Callable[[], Awaitable[T]]) -> T:
+    async with _llm_semaphore:
+        await _wait_for_llm_slot()
+        try:
+            return await call()
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                _mark_rate_limited_now(exc)
+            raise
 
 
 def _extract_access_token(
@@ -204,8 +278,8 @@ async def chat(
 
     try:
         with request_access_token_scope(access_token):
-            async with _llm_semaphore:
-                result = await asyncio.wait_for(
+            async def _invoke_agent():
+                return await asyncio.wait_for(
                     graph.ainvoke(
                         {"messages": [HumanMessage(content=chat_input)]},
                         config={
@@ -215,6 +289,8 @@ async def chat(
                     ),
                     timeout=AGENT_TIMEOUT_SECONDS,
                 )
+
+            result = await _run_llm_call(_invoke_agent)
         answer = result["messages"][-1].content
         _safe_save_session_turn(payload.sessionId, payload.question, answer)
         return {"answer": answer, "source": "agent"}
@@ -223,7 +299,7 @@ async def chat(
 
         # Avoid triggering another immediate LLM call when already rate-limited.
         if _is_rate_limit_error(exc):
-            _mark_rate_limited_now()
+            _mark_rate_limited_now(exc)
             return {
                 "answer": "AI đang quá tải. Bạn chờ 10-20 giây để thử lại nhé.",
                 "source": "rate-limit",
@@ -245,12 +321,11 @@ async def chat(
         """
 
         try:
-            async with _llm_semaphore:
-                llm_result = await asyncio.to_thread(llm.invoke, prompt)
+            llm_result = await _run_llm_call(lambda: asyncio.to_thread(llm.invoke, prompt))
             answer = llm_result.content
         except Exception as fallback_exc:
             if _is_rate_limit_error(fallback_exc):
-                _mark_rate_limited_now()
+                _mark_rate_limited_now(fallback_exc)
                 return {
                     "answer": "AI đang quá tải. Bạn chờ 10-20 giây để thử lại nhé.",
                     "source": "rate-limit",
@@ -272,6 +347,8 @@ async def generate_conversation_title(payload: ConversationTitleRequest):
     message = payload.message.strip()
     if not message:
         return {"title": "Cuộc trò chuyện mới", "source": "fallback"}
+    if _is_in_rate_limit_cooldown():
+        return {"title": _build_title_fallback(message), "source": "rate-limit-cooldown"}
 
     prompt = f"""
     Bạn là trợ lý đặt tiêu đề cho cuộc hội thoại.
@@ -286,8 +363,7 @@ async def generate_conversation_title(payload: ConversationTitleRequest):
     """
 
     try:
-        async with _llm_semaphore:
-            llm_result = await asyncio.to_thread(llm.invoke, prompt)
+        llm_result = await _run_llm_call(lambda: asyncio.to_thread(llm.invoke, prompt))
         title = _normalize_generated_title(llm_result.content)
         if not title:
             raise ValueError("Empty title returned from LLM")
