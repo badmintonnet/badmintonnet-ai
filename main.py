@@ -29,6 +29,16 @@ AGENT_RECURSION_LIMIT = int(os.getenv("AGENT_RECURSION_LIMIT", "6"))
 LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "1"))
 LLM_MIN_INTERVAL_SECONDS = float(os.getenv("LLM_MIN_INTERVAL_SECONDS", "3"))
 RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "35"))
+MEMORY_CONTEXT_CHAR_LIMIT = 1500
+RAG_CONTEXT_CHAR_LIMIT = 2500
+CHAT_INPUT_CHAR_LIMIT = 5000
+FALLBACK_RAG_PROMPT = """
+Ban la tro ly BadmintonNet.
+Chi tra loi bang tieng Viet.
+Chi dung Session memory va Context duoc cung cap trong prompt nay.
+Khong goi tool, khong tao tool call, khong tra ve JSON tool call.
+Neu Context khong co du lieu can thiet, hay noi ro chua co thong tin.
+"""
 _llm_semaphore = asyncio.Semaphore(max(1, LLM_MAX_CONCURRENCY))
 _llm_schedule_lock = asyncio.Lock()
 _next_llm_request_at = 0.0
@@ -39,6 +49,13 @@ T = TypeVar("T")
 def _shorten(value: object, limit: int = 300) -> str:
     text = str(value).replace("\n", " ")
     return text if len(text) <= limit else f"{text[:limit]}..."
+
+
+def _truncate_context(value: object, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}\n...[context truncated]"
 
 
 class ToolLogHandler(BaseCallbackHandler):
@@ -83,7 +100,19 @@ class ConversationTitleRequest(BaseModel):
     message: str
 
 
+def _is_payload_too_large_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "413" in text
+        or "payload too large" in text
+        or "request too large" in text
+    )
+
+
 def _is_rate_limit_error(exc: Exception) -> bool:
+    if _is_payload_too_large_error(exc):
+        return False
+
     text = str(exc).lower()
     return (
         "429" in text
@@ -265,9 +294,18 @@ async def chat(
     graph = await get_graph()
     mcp_tool_names = get_mcp_tool_names()
     access_token = _extract_access_token(payload.access_token, authorization)
-    memory_context = _safe_get_session_memory_context(payload.sessionId, payload.question)
-    rag_context = _safe_get_rag_context(payload.question)
-    chat_input = _build_chat_input(payload.question, memory_context, rag_context)
+    memory_context = _truncate_context(
+        _safe_get_session_memory_context(payload.sessionId, payload.question),
+        MEMORY_CONTEXT_CHAR_LIMIT,
+    )
+    rag_context = _truncate_context(
+        _safe_get_rag_context(payload.question),
+        RAG_CONTEXT_CHAR_LIMIT,
+    )
+    chat_input = _truncate_context(
+        _build_chat_input(payload.question, memory_context, rag_context),
+        CHAT_INPUT_CHAR_LIMIT,
+    )
     logger.info("[CHAT] access_token_present=%s", bool(access_token))
     logger.info("[CHAT] session_id=%s", payload.sessionId)
     logger.info("[CHAT] question=%s", _shorten(payload.question, 200))
@@ -295,20 +333,29 @@ async def chat(
         _safe_save_session_turn(payload.sessionId, payload.question, answer)
         return {"answer": answer, "source": "agent"}
     except Exception as exc:
-        logger.exception("[CHAT] Agent failed, fallback to RAG: %s", exc)
+        if _is_payload_too_large_error(exc):
+            logger.warning("[CHAT] Agent request too large: %s", exc)
+            return {
+                "answer": "AI đang nhận quá nhiều ngữ cảnh nên chưa thể trả lời. Bạn thử hỏi ngắn hơn hoặc giảm bớt dữ liệu liên quan rồi thử lại nhé.",
+                "source": "payload-too-large",
+                "error": str(exc),
+            }
 
         # Avoid triggering another immediate LLM call when already rate-limited.
         if _is_rate_limit_error(exc):
             _mark_rate_limited_now(exc)
+            logger.warning("[CHAT] Agent rate-limited: %s", exc)
             return {
                 "answer": "AI đang quá tải. Bạn chờ 10-20 giây để thử lại nhé.",
                 "source": "rate-limit",
                 "error": str(exc),
             }
 
+        logger.exception("[CHAT] Agent failed, fallback to RAG: %s", exc)
+
         # Fallback to direct RAG answer if tool-calling fails.
         prompt = f"""
-        {SYSTEM_PROMPT}
+        {FALLBACK_RAG_PROMPT}
 
         Session memory:
         {memory_context}
@@ -324,6 +371,12 @@ async def chat(
             llm_result = await _run_llm_call(lambda: asyncio.to_thread(llm.invoke, prompt))
             answer = llm_result.content
         except Exception as fallback_exc:
+            if _is_payload_too_large_error(fallback_exc):
+                return {
+                    "answer": "AI đang nhận quá nhiều ngữ cảnh nên chưa thể trả lời. Bạn thử hỏi ngắn hơn hoặc giảm bớt dữ liệu liên quan rồi thử lại nhé.",
+                    "source": "payload-too-large",
+                    "error": str(fallback_exc),
+                }
             if _is_rate_limit_error(fallback_exc):
                 _mark_rate_limited_now(fallback_exc)
                 return {
