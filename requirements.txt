@@ -3,7 +3,7 @@ uvicorn
 langchain
 langchain-core
 langchain-community
-langchain-groq
+langchain-openai
 langchain-huggingface
 langchain-text-splitters
 langchain-mcp-adapters

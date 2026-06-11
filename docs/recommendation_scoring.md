@@ -34,11 +34,14 @@ Sau đó cộng thêm:
   - Nếu lệch nhẹ không quá 0.5 điểm so với khoảng trình độ của CLB: +12.
   - Nếu lệch nhiều: +2.
 - Khoảng cách:
-  - Không quá 3 km: +24.
-  - Không quá 7 km: +20.
-  - Không quá 15 km: +14.
-  - Không quá 30 km: +8.
-  - Xa hơn 30 km: +3.
+  - Không quá 3 km: +32.
+  - Không quá 7 km: +28.
+  - Không quá 15 km: +20.
+  - Không quá 30 km: +12.
+  - Không quá 60 km: +2.
+  - Không quá 100 km: -8.
+  - Không quá 300 km: -18.
+  - Xa hơn 300 km: -35.
   - Nếu thiếu dữ liệu vị trí: +6.
 - Tag/phong cách CLB:
   - Nếu CLB có tag giống các CLB người dùng từng tham gia hoặc quan tâm: +12.
@@ -56,7 +59,7 @@ Hệ thống không gợi ý lại các CLB mà người dùng đã là thành v
 Sau đó cộng thêm:
 
 - Phù hợp trình độ: tối đa +22.
-- Khoảng cách: tối đa +24.
+- Khoảng cách: tối đa +32, và có thể bị trừ điểm nếu quá xa.
 - Trùng ngày người dùng thường tham gia: +6.
 - Trùng khung giờ quen thuộc với lịch của người dùng: +6.
 - Người dùng đang là thành viên CLB tổ chức hoạt động: +14.
@@ -71,7 +74,7 @@ Hệ thống loại bỏ các hoạt động mà người dùng đã đăng ký 
 
 Sau đó cộng thêm:
 
-- Khoảng cách: tối đa +24.
+- Khoảng cách: tối đa +32, và có thể bị trừ điểm nếu quá xa.
 - Phù hợp trình độ theo hạng mục giải đấu: tối đa +22.
 - Có hạng mục giống lịch sử thi đấu của người dùng: +12.
 - Trùng ngày hoặc khung giờ quen thuộc: tối đa +6.

@@ -2,7 +2,7 @@
 
 ## Điểm phù hợp tính theo cách nào?
 
-Điểm phù hợp được tính bằng cách cộng điểm từ nhiều tiêu chí, sau đó giới hạn trong thang 0-100. Với CLB, hệ thống xét điểm nền, độ phù hợp trình độ, khoảng cách, tag/phong cách CLB, reputation và giới hạn thành viên. Với hoạt động và giải đấu, hệ thống còn xét lịch cá nhân, hạng mục yêu thích, trạng thái còn slot hoặc đang mở đăng ký.
+Điểm phù hợp được tính bằng cách cộng điểm từ nhiều tiêu chí, sau đó giới hạn trong thang 0-100. Với CLB, hệ thống xét điểm nền, độ phù hợp trình độ, khoảng cách, tag/phong cách CLB, reputation và giới hạn thành viên. Khoảng cách gần được cộng nhiều điểm, còn địa điểm quá xa sẽ bị trừ điểm mạnh. Với hoạt động và giải đấu, hệ thống còn xét lịch cá nhân, hạng mục yêu thích, trạng thái còn slot hoặc đang mở đăng ký.
 
 ## Vì sao CLB này được gợi ý cho tôi?
 
