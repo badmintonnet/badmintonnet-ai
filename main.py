@@ -6,10 +6,19 @@ import os
 import re
 import time
 from typing import TypeVar
+import warnings
+
+from langchain_core._api.deprecation import LangChainPendingDeprecationWarning
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"The default value of `allowed_objects` will change in a future version\..*",
+    category=LangChainPendingDeprecationWarning,
+)
 
 from fastapi import FastAPI, Header
 from langchain_core.callbacks.base import BaseCallbackHandler
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel
 
 from agent.graph import cleanup_graph, get_graph, get_mcp_tool_names
@@ -48,6 +57,8 @@ T = TypeVar("T")
 
 def _shorten(value: object, limit: int = 300) -> str:
     text = str(value).replace("\n", " ")
+    text = re.sub(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", "<email>", text)
+    text = re.sub(r"(?<!\d)(0\d{8,10})(?!\d)", "<phone>", text)
     return text if len(text) <= limit else f"{text[:limit]}..."
 
 
@@ -280,6 +291,74 @@ def _build_title_fallback(message: str) -> str:
     return fallback[:120]
 
 
+def _message_content_to_text(content: object) -> str:
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if text:
+                    parts.append(str(text))
+            elif item:
+                parts.append(str(item))
+        return "\n".join(parts).strip()
+
+    return str(content or "").strip()
+
+
+def _extract_agent_answer(result: object) -> str:
+    messages = result.get("messages", []) if isinstance(result, dict) else []
+    for message in reversed(messages):
+        if not isinstance(message, AIMessage):
+            continue
+        content = _message_content_to_text(message.content)
+        if content:
+            return content
+    return ""
+
+
+def _format_agent_messages_for_final_answer(result: object, limit: int = 6000) -> str:
+    messages = result.get("messages", []) if isinstance(result, dict) else []
+    lines = []
+    for message in messages[-12:]:
+        role = getattr(message, "type", message.__class__.__name__)
+        content = _message_content_to_text(getattr(message, "content", ""))
+        if not content:
+            continue
+        lines.append(f"{role}:\n{content}")
+
+    text = "\n\n".join(lines)
+    return _truncate_context(text, limit)
+
+
+async def _recover_empty_agent_answer(result: object, question: str) -> str:
+    transcript = _format_agent_messages_for_final_answer(result)
+    if not transcript:
+        return ""
+
+    prompt = f"""
+    Bạn là trợ lý BadmintonNet. Hãy viết câu trả lời cuối cùng bằng tiếng Việt
+    dựa trên kết quả tool và ngữ cảnh bên dưới.
+
+    Yêu cầu:
+    - Không trả rỗng.
+    - Không bịa dữ liệu ngoài tool/ngữ cảnh.
+    - Trả lời trực tiếp câu hỏi của người dùng.
+    - Nếu câu hỏi là gợi ý tập luyện, hãy dựa vào trình độ/rating hiện có để đưa kế hoạch cụ thể.
+
+    Câu hỏi:
+    {question}
+
+    Ngữ cảnh và kết quả tool:
+    {transcript}
+    """
+    llm_result = await _run_llm_call(lambda: asyncio.to_thread(llm.invoke, prompt))
+    return _message_content_to_text(llm_result.content)
+
+
 @app.post("/chat")
 async def chat(
     payload: ChatRequest,
@@ -329,7 +408,14 @@ async def chat(
                 )
 
             result = await _run_llm_call(_invoke_agent)
-        answer = result["messages"][-1].content
+        answer = _extract_agent_answer(result)
+        if not answer:
+            logger.warning("[CHAT] Agent returned empty answer; recovering from tool outputs")
+            answer = await _recover_empty_agent_answer(result, payload.question)
+
+        if not answer:
+            answer = "Mình chưa tạo được câu trả lời từ dữ liệu hiện có. Bạn thử hỏi lại ngắn hơn hoặc cung cấp thêm mục tiêu tập luyện cụ thể nhé."
+
         _safe_save_session_turn(payload.sessionId, payload.question, answer)
         return {"answer": answer, "source": "agent"}
     except Exception as exc:
