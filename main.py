@@ -24,7 +24,14 @@ from pydantic import BaseModel
 from agent.graph import cleanup_graph, get_graph, get_mcp_tool_names
 from agent.request_context import request_access_token_scope
 from memory.store import get_session_memory_context, save_session_turn
-from models.llm import llm
+from models.llm import (
+    OPENAI_MODEL,
+    OPENAI_RECOVERY_MODEL,
+    OPENAI_TITLE_MODEL,
+    llm,
+    recovery_llm,
+    title_llm,
+)
 from prompts.system_prompt import SYSTEM_PROMPT
 from rag.retriever import retriever
 
@@ -93,6 +100,12 @@ class ToolLogHandler(BaseCallbackHandler):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info(
+        "[LLM_CONFIG] agent=%s recovery=%s title=%s",
+        OPENAI_MODEL,
+        OPENAI_RECOVERY_MODEL,
+        OPENAI_TITLE_MODEL,
+    )
     # Warm up graph on startup so first request is faster.
     await get_graph()
     yield
@@ -469,7 +482,7 @@ async def _recover_empty_agent_answer(result: object, question: str) -> str:
     Ngữ cảnh và kết quả tool:
     {transcript}
     """
-    llm_result = await _run_llm_call(lambda: asyncio.to_thread(llm.invoke, prompt))
+    llm_result = await _run_llm_call(lambda: asyncio.to_thread(recovery_llm.invoke, prompt))
     return _message_content_to_text(llm_result.content)
 
 
@@ -509,6 +522,7 @@ async def chat(
     logger.info("[CHAT] access_token_present=%s", bool(access_token))
     logger.info("[CHAT] session_id=%s", payload.sessionId)
     logger.info("[CHAT] question=%s", _shorten(question, 200))
+    logger.info("[CHAT] model_role=agent model=%s", OPENAI_MODEL)
     logger.info(
         "[CHAT] mcp_tools=%s",
         ", ".join(sorted(mcp_tool_names)) if mcp_tool_names else "none",
@@ -531,7 +545,10 @@ async def chat(
             result = await _run_llm_call(_invoke_agent)
         answer = _extract_agent_answer(result)
         if not answer:
-            logger.warning("[CHAT] Agent returned empty answer; recovering from tool outputs")
+            logger.warning(
+                "[CHAT] Agent returned empty answer; recovering from tool outputs model_role=recovery model=%s",
+                OPENAI_RECOVERY_MODEL,
+            )
             answer = await _recover_empty_agent_answer(result, payload.question)
 
         if not answer:
@@ -575,7 +592,8 @@ async def chat(
         """
 
         try:
-            llm_result = await _run_llm_call(lambda: asyncio.to_thread(llm.invoke, prompt))
+            logger.info("[CHAT] fallback_rag model_role=recovery model=%s", OPENAI_RECOVERY_MODEL)
+            llm_result = await _run_llm_call(lambda: asyncio.to_thread(recovery_llm.invoke, prompt))
             answer = llm_result.content
         except Exception as fallback_exc:
             if _is_payload_too_large_error(fallback_exc):
@@ -623,7 +641,8 @@ async def generate_conversation_title(payload: ConversationTitleRequest):
     """
 
     try:
-        llm_result = await _run_llm_call(lambda: asyncio.to_thread(llm.invoke, prompt))
+        logger.info("[TITLE] model_role=title model=%s", OPENAI_TITLE_MODEL)
+        llm_result = await _run_llm_call(lambda: asyncio.to_thread(title_llm.invoke, prompt))
         title = _normalize_generated_title(llm_result.content)
         if not title:
             raise ValueError("Empty title returned from LLM")
