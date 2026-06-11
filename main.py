@@ -34,13 +34,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("badmintonnet.agent")
 AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "45"))
-AGENT_RECURSION_LIMIT = int(os.getenv("AGENT_RECURSION_LIMIT", "6"))
+AGENT_RECURSION_LIMIT = int(os.getenv("AGENT_RECURSION_LIMIT", "8"))
 LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "1"))
 LLM_MIN_INTERVAL_SECONDS = float(os.getenv("LLM_MIN_INTERVAL_SECONDS", "3"))
 RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "35"))
-MEMORY_CONTEXT_CHAR_LIMIT = 1500
-RAG_CONTEXT_CHAR_LIMIT = 2500
-CHAT_INPUT_CHAR_LIMIT = 5000
+MEMORY_CONTEXT_CHAR_LIMIT = int(os.getenv("MEMORY_CONTEXT_CHAR_LIMIT", "900"))
+RAG_CONTEXT_CHAR_LIMIT = int(os.getenv("RAG_CONTEXT_CHAR_LIMIT", "1200"))
+CHAT_INPUT_CHAR_LIMIT = int(os.getenv("CHAT_INPUT_CHAR_LIMIT", "2800"))
+RECOVERY_TRANSCRIPT_CHAR_LIMIT = int(os.getenv("RECOVERY_TRANSCRIPT_CHAR_LIMIT", "3000"))
 FALLBACK_RAG_PROMPT = """
 Ban la tro ly BadmintonNet.
 Chi tra loi bang tieng Viet.
@@ -291,6 +292,116 @@ def _build_title_fallback(message: str) -> str:
     return fallback[:120]
 
 
+def _normalize_for_intent(text: str) -> str:
+    lowered = text.strip().lower()
+    replacements = {
+        "à": "a",
+        "á": "a",
+        "ạ": "a",
+        "ả": "a",
+        "ã": "a",
+        "â": "a",
+        "ầ": "a",
+        "ấ": "a",
+        "ậ": "a",
+        "ẩ": "a",
+        "ẫ": "a",
+        "ă": "a",
+        "ằ": "a",
+        "ắ": "a",
+        "ặ": "a",
+        "ẳ": "a",
+        "ẵ": "a",
+        "è": "e",
+        "é": "e",
+        "ẹ": "e",
+        "ẻ": "e",
+        "ẽ": "e",
+        "ê": "e",
+        "ề": "e",
+        "ế": "e",
+        "ệ": "e",
+        "ể": "e",
+        "ễ": "e",
+        "ì": "i",
+        "í": "i",
+        "ị": "i",
+        "ỉ": "i",
+        "ĩ": "i",
+        "ò": "o",
+        "ó": "o",
+        "ọ": "o",
+        "ỏ": "o",
+        "õ": "o",
+        "ô": "o",
+        "ồ": "o",
+        "ố": "o",
+        "ộ": "o",
+        "ổ": "o",
+        "ỗ": "o",
+        "ơ": "o",
+        "ờ": "o",
+        "ớ": "o",
+        "ợ": "o",
+        "ở": "o",
+        "ỡ": "o",
+        "ù": "u",
+        "ú": "u",
+        "ụ": "u",
+        "ủ": "u",
+        "ũ": "u",
+        "ư": "u",
+        "ừ": "u",
+        "ứ": "u",
+        "ự": "u",
+        "ử": "u",
+        "ữ": "u",
+        "ỳ": "y",
+        "ý": "y",
+        "ỵ": "y",
+        "ỷ": "y",
+        "ỹ": "y",
+        "đ": "d",
+    }
+    return "".join(replacements.get(char, char) for char in lowered)
+
+
+def _is_simple_acknowledgement(question: str) -> bool:
+    normalized = _normalize_for_intent(question)
+    normalized = re.sub(r"[^\w\s]", " ", normalized)
+    normalized = " ".join(normalized.split())
+    if len(normalized) > 40:
+        return False
+
+    ack_phrases = {
+        "ok",
+        "okay",
+        "cam on",
+        "cam on ban",
+        "thanks",
+        "thank you",
+        "rat cam on",
+        "duoc roi",
+        "on roi",
+    }
+    return normalized in ack_phrases
+
+
+def _should_skip_rag_context(question: str) -> bool:
+    normalized = _normalize_for_intent(question)
+    personal_markers = (
+        "cua toi",
+        "cho toi",
+        "lich cua toi",
+        "trinh do",
+        "rating",
+        "gan toi",
+        "phu hop voi toi",
+        "goi y cho toi",
+    )
+    return any(marker in normalized for marker in personal_markers)
+
+
 def _message_content_to_text(content: object) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -320,10 +431,13 @@ def _extract_agent_answer(result: object) -> str:
     return ""
 
 
-def _format_agent_messages_for_final_answer(result: object, limit: int = 6000) -> str:
+def _format_agent_messages_for_final_answer(
+    result: object,
+    limit: int = RECOVERY_TRANSCRIPT_CHAR_LIMIT,
+) -> str:
     messages = result.get("messages", []) if isinstance(result, dict) else []
     lines = []
-    for message in messages[-12:]:
+    for message in messages[-8:]:
         role = getattr(message, "type", message.__class__.__name__)
         content = _message_content_to_text(getattr(message, "content", ""))
         if not content:
@@ -370,24 +484,31 @@ async def chat(
             "source": "rate-limit-cooldown",
         }
 
-    graph = await get_graph()
-    mcp_tool_names = get_mcp_tool_names()
+    question = payload.question.strip()
+    if _is_simple_acknowledgement(question):
+        answer = "Rất vui được hỗ trợ bạn. Khi cần thêm thông tin về cầu lông hoặc BadmintonNet, bạn cứ hỏi tiếp nhé."
+        _safe_save_session_turn(payload.sessionId, payload.question, answer)
+        return {"answer": answer, "source": "simple-ack"}
+
     access_token = _extract_access_token(payload.access_token, authorization)
     memory_context = _truncate_context(
-        _safe_get_session_memory_context(payload.sessionId, payload.question),
+        _safe_get_session_memory_context(payload.sessionId, question),
         MEMORY_CONTEXT_CHAR_LIMIT,
     )
+    raw_rag_context = "" if _should_skip_rag_context(question) else _safe_get_rag_context(question)
     rag_context = _truncate_context(
-        _safe_get_rag_context(payload.question),
+        raw_rag_context,
         RAG_CONTEXT_CHAR_LIMIT,
     )
     chat_input = _truncate_context(
-        _build_chat_input(payload.question, memory_context, rag_context),
+        _build_chat_input(question, memory_context, rag_context),
         CHAT_INPUT_CHAR_LIMIT,
     )
+    graph = await get_graph()
+    mcp_tool_names = get_mcp_tool_names()
     logger.info("[CHAT] access_token_present=%s", bool(access_token))
     logger.info("[CHAT] session_id=%s", payload.sessionId)
-    logger.info("[CHAT] question=%s", _shorten(payload.question, 200))
+    logger.info("[CHAT] question=%s", _shorten(question, 200))
     logger.info(
         "[CHAT] mcp_tools=%s",
         ", ".join(sorted(mcp_tool_names)) if mcp_tool_names else "none",
